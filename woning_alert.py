@@ -1,11 +1,11 @@
 import os
+import re
 import json
 import hashlib
 import smtplib
-import urllib.request
 from email.message import EmailMessage
-from html.parser import HTMLParser
-from urllib.parse import urljoin
+
+from playwright.sync_api import sync_playwright
 
 URL = "https://www.woninghuren.nl/aanbod/te-huur"
 MAX_HUUR = 800
@@ -17,84 +17,103 @@ EMAIL_PASSWORD = os.environ["EMAIL_PASSWORD"]
 
 STATE_FILE = "bekende_woningen.json"
 
-
-class LinkParser(HTMLParser):
-    def __init__(self):
-        super().__init__()
-        self.links = []
-        self.current = None
-
-    def handle_starttag(self, tag, attrs):
-        if tag == "a":
-            attrs = dict(attrs)
-            href = attrs.get("href")
-            if href:
-                self.current = {
-                    "url": urljoin(URL, href),
-                    "text": ""
-                }
-
-    def handle_data(self, data):
-        if self.current:
-            self.current["text"] += " " + data.strip()
-
-    def handle_endtag(self, tag):
-        if tag == "a" and self.current:
-            self.links.append(self.current)
-            self.current = None
-
-
-def download_page(url):
-    request = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": "Mozilla/5.0 (compatible; WoningAlert/1.0)"
-        }
-    )
-
-    with urllib.request.urlopen(request, timeout=30) as response:
-        return response.read().decode("utf-8", errors="ignore")
+# Alleen links die naar een echte advertentie verwijzen, geen menu/footer-links.
+DETAIL_PATH = "/aanbod/te-huur/details/"
 
 
 def get_woningen():
-    html = download_page(URL)
+    """
+    Opent de pagina in een echte (headless) browser zodat JavaScript-inhoud
+    (zoals huurprijs en aantal kamers) ook echt geladen wordt, en haalt
+    daarna alle advertentielinks met bijbehorende tekst op.
+    """
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        page = browser.new_page(
+            user_agent="Mozilla/5.0 (compatible; WoningAlert/1.0)"
+        )
+        page.goto(URL, wait_until="networkidle", timeout=60000)
+        # Extra marge voor eventuele vertraagde (lazy-loaded) inhoud
+        page.wait_for_timeout(3000)
 
-    parser = LinkParser()
-    parser.feed(html)
+        data = page.evaluate(
+            """
+            (detailPath) => {
+                const links = Array.from(document.querySelectorAll('a[href*="' + detailPath + '"]'));
+                const seen = new Set();
+                const result = [];
+                for (const link of links) {
+                    const href = link.href;
+                    if (seen.has(href)) continue;
+                    seen.add(href);
 
-    woningen = []
+                    // Klim een paar niveaus omhoog in de HTML, zodat we ook
+                    // de prijs/kamers-tekst rond de link meepakken.
+                    let node = link;
+                    for (let i = 0; i < 3 && node.parentElement; i++) {
+                        node = node.parentElement;
+                    }
 
-    for link in parser.links:
-        text = " ".join(link["text"].split())
-        url = link["url"]
+                    result.push({
+                        url: href,
+                        text: node.innerText.replace(/\\s+/g, ' ').trim()
+                    });
+                }
+                return result;
+            }
+            """,
+            DETAIL_PATH,
+        )
+        browser.close()
 
-        # Alleen links naar woningadvertenties proberen te verwerken
-        if not text:
-            continue
+    return data
 
-        woningen.append({
-            "url": url,
-            "text": text
-        })
 
-    # Dubbele links verwijderen
-    unique = {}
-    for woning in woningen:
-        unique[woning["url"]] = woning
+def parse_prijs(text):
+    """Haalt het eerste bedrag na een € teken uit de tekst, als getal."""
+    match = re.search(r"€\s*([\d.,]+)", text)
+    if not match:
+        return None
+    getal = match.group(1).replace(".", "").replace(",", ".")
+    try:
+        return float(getal)
+    except ValueError:
+        return None
 
-    return list(unique.values())
+
+def parse_kamers(text):
+    """Haalt het aantal kamers/slaapkamers uit de tekst, als getal."""
+    match = re.search(r"(\d+)\s*(slaapkamer|kamer)", text, re.IGNORECASE)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def voldoet_aan_criteria(woning):
+    """
+    True als de woning past binnen MAX_HUUR en MIN_KAMERS.
+    Als prijs/kamers niet uit de tekst te halen zijn, laten we 'm er
+    (voor de zekerheid) toch doorheen, zodat je niks mist.
+    """
+    prijs = parse_prijs(woning["text"])
+    kamers = parse_kamers(woning["text"])
+    woning["prijs"] = prijs
+    woning["kamers"] = kamers
+
+    if prijs is not None and prijs > MAX_HUUR:
+        return False
+    if kamers is not None and kamers < MIN_KAMERS:
+        return False
+    return True
 
 
 def woning_id(woning):
-    return hashlib.sha256(
-        woning["url"].encode("utf-8")
-    ).hexdigest()
+    return hashlib.sha256(woning["url"].encode("utf-8")).hexdigest()
 
 
 def load_known():
     if not os.path.exists(STATE_FILE):
         return set()
-
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             return set(json.load(f))
@@ -115,19 +134,16 @@ def send_email(nieuwe_woningen):
 
     body = [
         "Nieuwe woning(en) gevonden op WoningHuren.nl:",
-        ""
+        "",
     ]
-
     for woning in nieuwe_woningen:
-        body.append(f"🏠 {woning['text']}")
+        body.append(f"🏠 {woning['text'][:250]}")
         body.append(f"🔗 {woning['url']}")
         body.append("")
-
     body.append(
         "Controleer altijd op WoningHuren.nl of de woning "
         "voor jullie passend is."
     )
-
     msg.set_content("\n".join(body))
 
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
@@ -140,21 +156,21 @@ def main():
     woningen = get_woningen()
 
     nieuwe = []
-
     for woning in woningen:
         wid = woning_id(woning)
-
-        if wid not in known:
+        if wid in known:
+            continue
+        known.add(wid)
+        if voldoet_aan_criteria(woning):
             nieuwe.append(woning)
-            known.add(wid)
 
     save_known(known)
 
     if nieuwe:
         send_email(nieuwe)
-        print(f"{len(nieuwe)} nieuwe woningen gemeld.")
+        print(f"{len(nieuwe)} nieuwe passende woningen gemeld.")
     else:
-        print("Geen nieuwe woningen.")
+        print("Geen nieuwe passende woningen.")
 
 
 if __name__ == "__main__":
