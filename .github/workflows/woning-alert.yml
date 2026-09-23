@@ -21,6 +21,11 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Playwright installeren
+        run: |
+          pip install playwright
+          playwright install --with-deps chromium
+
       - name: Woningen controleren
         env:
           EMAIL_USER: ${{ secrets.EMAIL_USER }}
