@@ -1,0 +1,40 @@
+name: Woning Alert Twente
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  check-woningen:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Repository ophalen
+        uses: actions/checkout@v4
+
+      - name: Python installeren
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Woningen controleren
+        env:
+          EMAIL_USER: ${{ secrets.EMAIL_USER }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+        run: python woning_alert.py
+
+      - name: Bekende woningen opslaan
+        run: |
+          git config user.name "woning-alert"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add bekende_woningen.json
+
+          if ! git diff --cached --quiet; then
+            git commit -m "Update bekende woningen"
+            git push
+          fi
